@@ -24,7 +24,7 @@ Your goal is to guide students (ages 8-16) through building their robotics kits.
 """
 
 model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
+    model_name="gemini-2.5-flash",
     system_instruction=socratic_instruction
 )
 
