@@ -1,63 +1,57 @@
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 from streamlit_mic_recorder import mic_recorder
-import google.generativeai as genai
-from google import genai as live_genai # New SDK for Live API features
+from google import genai
+from google.genai import types
 import cv2
 import os
 import threading
 import io
-import base64
-from PIL import Image
+import PIL.Image
 from dotenv import load_dotenv
 
 # 1. Setup & API Configuration
 load_dotenv()
+# Streamlit Cloud will use st.secrets; local will use .env
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-# Initialize both SDKs (One for standard config, one for Live features)
-genai.configure(api_key=api_key)
-client = live_genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
+# Use the latest GenAI Client for Live features
+client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
+MODEL_ID = "gemini-2.0-flash" # Stable version for 2026
 
 st.set_page_config(page_title="RobotBox AI Lab", layout="wide", page_icon="🤖")
 
-# 2. AI Tutor Socratic Instruction
+# 2. Socratic System Instructions
 socratic_instruction = """
 # ROLE
-    You are the RobotBox AI Tutor, an expert engineering mentor inspired by Sal Khan's Socratic teaching style. 
-    Your goal is to guide students (ages 8-16) through building robotics projects delivered in their monthly RobotBox.
+You are the RobotBox AI Tutor, an expert engineering mentor. 
+# SOCRATIC PRINCIPLES
+1. NEVER GIVE ANSWERS. If a student asks where a wire goes, ask them to identify the labels on the board.
+2. VALIDATE VISION: Use the camera feed to spot errors. Reference specific colors or shapes.
+3. BE CONCISE: Since you are responding with audio, keep your explanations brief and engaging.
+"""
 
-    # SOCRATIC PRINCIPLES
-    1. NEVER GIVE ANSWERS: If a student says "Where does this wire go?", do not say "Pin 5." Instead, ask "Looking at the motor driver, which pins are labeled for power?"
-    2. VALIDATE VISION: You can see their workspace via the camera. If you see a mistake (e.g., a loose battery), say "I'm looking at your battery pack... does that red wire look like it's tucked in all the way?"
-    3. THINK ALOUD: Explain the 'why.' Instead of "Check the code," say "I'm thinking about how the robot knows when to stop. What sensor would help it 'see' a wall?"
-    4. ENCOURAGE MISTAKES: If they fail, treat it as data. "That's a great 'oops'! What did the robot do differently than we expected?"
-
-    # TONE
-    Encouraging, curious, and professional but fun. Use analogies to explain complex electronics (e.g., "Electricity is like water flowing through pipes").
-    """
-
-# 3. Camera Buffer (Thread-safe)
+# 3. Vision Buffer (Thread-safe)
 lock = threading.Lock()
-img_container = {"img": None}
+shared_frames = {"img": None}
 
 def video_frame_callback(frame):
     img = frame.to_ndarray(format="bgr24")
     with lock:
-        img_container["img"] = img
+        shared_frames["img"] = img
     return frame
 
 # 4. UI Layout
-st.title("🤖 RobotBox AI Lab")
-st.caption("Now with Native Voice & Vision")
-st.markdown("---")
+st.title("🤖 RobotBox Lab: AI Tutor")
+st.caption("Native Voice & Vision Enabled")
+st.write("---")
 
-col_left, col_right = st.columns([1.5, 1])
+col_video, col_chat = st.columns([1.5, 1])
 
-with col_left:
+with col_video:
     st.subheader("📷 Engineering Feed")
     webrtc_streamer(
-        key="robotbox-live",
+        key="robotbox-vision",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration(
             {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -66,8 +60,9 @@ with col_left:
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
+    st.info("💡 Tip: Use headphones to prevent the AI from hearing itself!")
 
-with col_right:
+with col_chat:
     st.subheader("💬 AI Interaction")
     
     # Audio Recorder Component
@@ -75,59 +70,71 @@ with col_right:
     audio_data = mic_recorder(
         start_prompt="🎤 Start Speaking",
         stop_prompt="🛑 Stop & Send",
-        key='recorder'
+        key='robotbox_recorder'
     )
 
+    # Initialize chat history for text display
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Process Input
     if audio_data:
-        # 5. Process Multi-Modal Input
-        with st.spinner("Tutor is thinking..."):
+        with st.spinner("Tutor is analyzing..."):
             try:
-                # Capture the current camera frame
+                # Capture the current frame
                 with lock:
-                    current_frame = img_container["img"]
+                    current_frame = shared_frames["img"]
                 
-                # Prepare parts for Gemini
+                # Build Multimodal Parts using strict google.genai.types
                 parts = []
                 
-                # Add Audio
-                parts.append({
-                    "mime_type": "audio/wav",
-                    "data": base64.b64encode(audio_data['bytes']).decode()
-                })
+                # Add Audio Part
+                parts.append(
+                    types.Part.from_bytes(
+                        data=audio_data['bytes'], 
+                        mime_type="audio/wav"
+                    )
+                )
                 
-                # Add Image if available
+                # Add Vision Part
                 if current_frame is not None:
                     img_rgb = cv2.cvtColor(current_frame, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(img_rgb)
+                    pil_img = PIL.Image.fromarray(img_rgb)
                     img_byte_arr = io.BytesIO()
                     pil_img.save(img_byte_arr, format='JPEG')
-                    parts.append({
-                        "mime_type": "image/jpeg",
-                        "data": base64.b64encode(img_byte_arr.getvalue()).decode()
-                    })
+                    
+                    parts.append(
+                        types.Part.from_bytes(
+                            data=img_byte_arr.getvalue(), 
+                            mime_type="image/jpeg"
+                        )
+                    )
 
-                # 6. Call the Native Audio Model
-                # This model returns BOTH text and audio bytes
+                # Generate Content
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash-native-audio-preview-12-2025",
+                    model=MODEL_ID,
                     contents=parts,
-                    config={
-                        "system_instruction": socratic_instruction,
-                        "response_modalities": ["AUDIO", "TEXT"]
-                    }
+                    config=types.GenerateContentConfig(
+                        system_instruction=socratic_instruction,
+                        response_modalities=["AUDIO", "TEXT"]
+                    )
                 )
 
-                # 7. Output: Text and Audio
-                # Display text
+                # Output Text
                 if response.text:
-                    st.chat_message("assistant").write(response.text)
+                    with st.chat_message("assistant"):
+                        st.markdown(response.text)
                 
-                # Play Audio Response
-                # Note: The model returns raw PCM or WAV data depending on config
-                audio_part = next((p for p in response.candidates[0].content.parts if p.inline_data), None)
-                if audio_part:
-                    st.audio(audio_part.inline_data.data, format="audio/wav")
-                    st.success("🔈 Audio response generated!")
+                # Output Audio
+                # Finding the audio part in the response
+                for part in response.candidates[0].content.parts:
+                    if part.inline_data:
+                        st.audio(part.inline_data.data, format="audio/wav")
 
             except Exception as e:
                 st.error(f"Brain Error: {e}")
+
+    # Display message history (Optional)
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
