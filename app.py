@@ -1,21 +1,27 @@
 import streamlit as st
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from streamlit_mic_recorder import mic_recorder
 import google.generativeai as genai
+from google import genai as live_genai # New SDK for Live API features
 import cv2
-import av
 import os
 import threading
-from dotenv import load_dotenv
+import io
+import base64
 from PIL import Image
+from dotenv import load_dotenv
 
 # 1. Setup & API Configuration
 load_dotenv()
 api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+# Initialize both SDKs (One for standard config, one for Live features)
 genai.configure(api_key=api_key)
+client = live_genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
 
-st.set_page_config(page_title="RobotBox AI Tutor", layout="wide")
+st.set_page_config(page_title="RobotBox AI Lab", layout="wide", page_icon="🤖")
 
-# 2. Socratic Configuration
+# 2. AI Tutor Socratic Instruction
 socratic_instruction = """
 # ROLE
     You are the RobotBox AI Tutor, an expert engineering mentor inspired by Sal Khan's Socratic teaching style. 
@@ -31,13 +37,7 @@ socratic_instruction = """
     Encouraging, curious, and professional but fun. Use analogies to explain complex electronics (e.g., "Electricity is like water flowing through pipes").
     """
 
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash", # Using the faster 2.0 model
-    system_instruction=socratic_instruction
-)
-
-# 3. Thread-safe Frame Buffer
-# This captures the most recent image from the webcam stream
+# 3. Camera Buffer (Thread-safe)
 lock = threading.Lock()
 img_container = {"img": None}
 
@@ -47,15 +47,17 @@ def video_frame_callback(frame):
         img_container["img"] = img
     return frame
 
-# 4. Interface Layout
-st.title("🤖 RobotBox Lab: Socratic Tutor")
-col1, col2 = st.columns([2, 1])
+# 4. UI Layout
+st.title("🤖 RobotBox AI Lab")
+st.caption("Now with Native Voice & Vision")
+st.markdown("---")
 
-with col1:
-    st.subheader("Live Engineering Feed")
-    # WebRTC allows the camera to work on the deployed URL
-    webrtc_ctx = webrtc_streamer(
-        key="robotbox-feed",
+col_left, col_right = st.columns([1.5, 1])
+
+with col_left:
+    st.subheader("📷 Engineering Feed")
+    webrtc_streamer(
+        key="robotbox-live",
         mode=WebRtcMode.SENDRECV,
         rtc_configuration=RTCConfiguration(
             {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -64,37 +66,68 @@ with col1:
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
-    st.info("Click 'Start' above to open your webcam.")
 
-with col2:
-    st.subheader("Socratic Chat")
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+with col_right:
+    st.subheader("💬 AI Interaction")
+    
+    # Audio Recorder Component
+    st.write("Hold to talk to your Tutor:")
+    audio_data = mic_recorder(
+        start_prompt="🎤 Start Speaking",
+        stop_prompt="🛑 Stop & Send",
+        key='recorder'
+    )
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    if audio_data:
+        # 5. Process Multi-Modal Input
+        with st.spinner("Tutor is thinking..."):
+            try:
+                # Capture the current camera frame
+                with lock:
+                    current_frame = img_container["img"]
+                
+                # Prepare parts for Gemini
+                parts = []
+                
+                # Add Audio
+                parts.append({
+                    "mime_type": "audio/wav",
+                    "data": base64.b64encode(audio_data['bytes']).decode()
+                })
+                
+                # Add Image if available
+                if current_frame is not None:
+                    img_rgb = cv2.cvtColor(current_frame, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(img_rgb)
+                    img_byte_arr = io.BytesIO()
+                    pil_img.save(img_byte_arr, format='JPEG')
+                    parts.append({
+                        "mime_type": "image/jpeg",
+                        "data": base64.b64encode(img_byte_arr.getvalue()).decode()
+                    })
 
-    if prompt := st.chat_input("Ask about your build..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").write(prompt)
+                # 6. Call the Native Audio Model
+                # This model returns BOTH text and audio bytes
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash-native-audio-preview-12-2025",
+                    contents=parts,
+                    config={
+                        "system_instruction": socratic_instruction,
+                        "response_modalities": ["AUDIO", "TEXT"]
+                    }
+                )
 
-        # Get the latest frame for the AI to see
-        with lock:
-            latest_img = img_container["img"]
+                # 7. Output: Text and Audio
+                # Display text
+                if response.text:
+                    st.chat_message("assistant").write(response.text)
+                
+                # Play Audio Response
+                # Note: The model returns raw PCM or WAV data depending on config
+                audio_part = next((p for p in response.candidates[0].content.parts if p.inline_data), None)
+                if audio_part:
+                    st.audio(audio_part.inline_data.data, format="audio/wav")
+                    st.success("🔈 Audio response generated!")
 
-        with st.chat_message("assistant"):
-            with st.spinner("Analyzing your workspace..."):
-                try:
-                    contents = [prompt]
-                    if latest_img is not None:
-                        # Convert BGR to RGB for Gemini
-                        img_rgb = cv2.cvtColor(latest_img, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(img_rgb)
-                        contents.append(pil_img)
-                    
-                    response = model.generate_content(contents)
-                    st.markdown(response.text)
-                    st.session_state.messages.append({"role": "assistant", "content": response.text})
-                except Exception as e:
-                    st.error(f"Brain Error: {e}")
+            except Exception as e:
+                st.error(f"Brain Error: {e}")

@@ -1,7 +1,8 @@
 streamlit
-google-generativeai
 streamlit-webrtc
-av
+streamlit-mic-recorder
+google-genai
 opencv-python-headless
-python-dotenv
 Pillow
+pydub
+numpy
