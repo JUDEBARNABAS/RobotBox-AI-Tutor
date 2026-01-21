@@ -1,101 +1,100 @@
 import streamlit as st
-import cv2
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import google.generativeai as genai
+import cv2
+import av
 import os
+import threading
 from dotenv import load_dotenv
 from PIL import Image
 
 # 1. Setup & API Configuration
 load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
+api_key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=api_key)
 
 st.set_page_config(page_title="RobotBox AI Tutor", layout="wide")
 
-# 2. Define the Socratic Brain
-# This instruction forces the AI to act as a mentor, not just an answer-bot.
+# 2. Socratic Configuration
 socratic_instruction = """
-You are the RobotBox AI Tutor, a friendly engineering mentor. 
-Your goal is to guide students (ages 8-16) through building their robotics kits.
-- NEVER give direct answers (e.g., don't say 'Connect the red wire to Pin 5').
-- INSTEAD, ask guiding questions: 'What happens to the circuit if power doesn't have a path back to the battery?'
-- If they are stuck, ask them to describe what they see or hold a part up to the camera.
-- Use analogies like 'Electricity is like water flowing through pipes.'
-"""
+# ROLE
+    You are the RobotBox AI Tutor, an expert engineering mentor inspired by Sal Khan's Socratic teaching style. 
+    Your goal is to guide students (ages 8-16) through building robotics projects delivered in their monthly RobotBox.
+
+    # SOCRATIC PRINCIPLES
+    1. NEVER GIVE ANSWERS: If a student says "Where does this wire go?", do not say "Pin 5." Instead, ask "Looking at the motor driver, which pins are labeled for power?"
+    2. VALIDATE VISION: You can see their workspace via the camera. If you see a mistake (e.g., a loose battery), say "I'm looking at your battery pack... does that red wire look like it's tucked in all the way?"
+    3. THINK ALOUD: Explain the 'why.' Instead of "Check the code," say "I'm thinking about how the robot knows when to stop. What sensor would help it 'see' a wall?"
+    4. ENCOURAGE MISTAKES: If they fail, treat it as data. "That's a great 'oops'! What did the robot do differently than we expected?"
+
+    # TONE
+    Encouraging, curious, and professional but fun. Use analogies to explain complex electronics (e.g., "Electricity is like water flowing through pipes").
+    """
 
 model = genai.GenerativeModel(
-    model_name="gemini-2.5-flash",
+    model_name="gemini-2.0-flash", # Using the faster 2.0 model
     system_instruction=socratic_instruction
 )
 
-# 3. Sidebar for Settings
-with st.sidebar:
-    st.title("🤖 RobotBox Settings")
-    kit_month = st.selectbox("Current Box", ["Month 1: The Voyager", "Month 2: Sentry Arm"])
-    st.info(f"AI Tutor is now configured for {kit_month}")
-    
-    if st.button("Reset Session"):
-        st.session_state.messages = []
-        st.rerun()
+# 3. Thread-safe Frame Buffer
+# This captures the most recent image from the webcam stream
+lock = threading.Lock()
+img_container = {"img": None}
 
-# 4. Main Interface Layout
-st.title("Welcome to your RobotBox Lab")
+def video_frame_callback(frame):
+    img = frame.to_ndarray(format="bgr24")
+    with lock:
+        img_container["img"] = img
+    return frame
+
+# 4. Interface Layout
+st.title("🤖 RobotBox Lab: Socratic Tutor")
 col1, col2 = st.columns([2, 1])
 
-# Initialize Chat History
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-# Column 1: Live Video Feed
 with col1:
     st.subheader("Live Engineering Feed")
-    frame_placeholder = st.empty()
-    stop_button = st.button("Stop Camera")
-    
-    cap = cv2.VideoCapture(0)
-    while cap.isOpened() and not stop_button:
-        ret, frame = cap.read()
-        if not ret:
-            st.error("Webcam not detected.")
-            break
-            
-        # Convert BGR to RGB for Streamlit
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_placeholder.image(frame_rgb, channels="RGB")
-        
-        # In a real "Live API" setup, you'd send frames to Gemini here. 
-        # For now, we focus on the Socratic Chat interface.
-        if stop_button:
-            break
-    cap.release()
+    # WebRTC allows the camera to work on the deployed URL
+    webrtc_ctx = webrtc_streamer(
+        key="robotbox-feed",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTCConfiguration(
+            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+        ),
+        video_frame_callback=video_frame_callback,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    st.info("Click 'Start' above to open your webcam.")
 
-# Column 2: Socratic Chat Interface
 with col2:
-    st.subheader("AI Tutor Chat")
-    
-    # Display Chat History
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    st.subheader("Socratic Chat")
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    # Chat Input
-    if user_input := st.chat_input("Ask a question about your build..."):
-        # Add User Message to History
-        st.chat_message("user").write(user_input)
-        st.session_state.messages.append({"role": "user", "content": user_input})
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-        # Generate Socratic Response
-        try:
-            # We pass the full history for context
-            chat_session = model.start_chat(history=[
-                {"role": m["role"], "parts": [m["content"]]} for m in st.session_state.messages[:-1]
-            ])
-            response = chat_session.send_message(user_input)
-            
-            # Display Assistant Response
-            with st.chat_message("assistant"):
-                st.markdown(response.text)
-            st.session_state.messages.append({"role": "assistant", "content": response.text})
-            
-        except Exception as e:
-            st.error(f"Error connecting to Gemini: {e}")
+    if prompt := st.chat_input("Ask about your build..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+
+        # Get the latest frame for the AI to see
+        with lock:
+            latest_img = img_container["img"]
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing your workspace..."):
+                try:
+                    contents = [prompt]
+                    if latest_img is not None:
+                        # Convert BGR to RGB for Gemini
+                        img_rgb = cv2.cvtColor(latest_img, cv2.COLOR_BGR2RGB)
+                        pil_img = Image.fromarray(img_rgb)
+                        contents.append(pil_img)
+                    
+                    response = model.generate_content(contents)
+                    st.markdown(response.text)
+                    st.session_state.messages.append({"role": "assistant", "content": response.text})
+                except Exception as e:
+                    st.error(f"Brain Error: {e}")
